@@ -1,94 +1,109 @@
 
-#!/usr/bin/env python3
-
-"""
-=========================================================
- AIR QUALITY & ENVIRONMENT MONITORING
- Raspberry Pi + Python 3
-
- Sensors:
- 1. Sensirion SPS30       I2C 0x69
- 2. DFRobot MiCS-4514     I2C 0x75
- 3. ADS1115 + MQ-136      I2C 0x48
- 4. GY-SHT41              I2C 0x44
- 5. GY-BMP280             I2C 0x76
-
- Output:
- - Terminal monitoring
- - CSV data logging
-
- MiCS-4514:
- - DFRobot SEN0377 logic
- - Wake-up
- - 180 seconds warm-up
- - 10 samples R0 calibration
- - Gas conversion from DFRobot library
-=========================================================
-"""
-
 import time
 import csv
 import os
-import sys
-
 from datetime import datetime
 
 import smbus2
-
 import board
-
-import adafruit_sht4x
-import adafruit_bmp280
 
 import adafruit_ads1x15.ads1115 as ADS
 from adafruit_ads1x15.analog_in import AnalogIn
 
-from sensirion_i2c_driver import (
-    LinuxI2cTransceiver,
-    I2cConnection,
-    CrcCalculator
-)
+import adafruit_sht4x
+import adafruit_bmp280
 
-from sensirion_driver_adapters.i2c_adapter.i2c_channel import (
-    I2cChannel
-)
-
-from sensirion_i2c_sps30.device import Sps30Device
-from sensirion_i2c_sps30.commands import OutputFormat
+from sensirion_i2c_driver import LinuxI2cTransceiver
+from sensirion_i2c_driver import I2cConnection
+from sensirion_i2c_driver import CrcCalculator
+from sensirion_i2c_driver import I2cChannel
+from sensirion_i2c_sps30 import Sps30Device, OutputFormat
 
 
-# =========================================================
+# ============================================================
 # CONFIGURATION
-# =========================================================
+# ============================================================
 
 I2C_BUS = 1
-I2C_PORT = "/dev/i2c-1"
+I2C_DEVICE = "/dev/i2c-1"
 
-ADDR_SPS30 = 0x69
-ADDR_MICS = 0x75
-ADDR_ADS1115 = 0x48
-ADDR_SHT41 = 0x44
-ADDR_BMP280 = 0x76
+SPS30_ADDRESS = 0x69
+MICS_ADDRESS = 0x75
+ADS_ADDRESS = 0x48
+SHT41_ADDRESS = 0x44
+BMP280_ADDRESS = 0x76
 
-SAMPLE_INTERVAL = 2.0
+LOG_FILE = "environment_monitoring.csv"
 
-MICS_CALIBRATION_TIME = 180
+INTERVAL = 2
+
+# MiCS-4514
+MICS_WARMUP_SECONDS = 180
 MICS_CALIBRATION_SAMPLES = 10
 
-CSV_FILE = "environment_monitoring.csv"
+# MQ-136 ADS1115
+ADS_GAIN = 1
 
 
-# =========================================================
-# GLOBAL VARIABLES
-# =========================================================
+# ============================================================
+# CSV HEADER
+# ============================================================
+
+CSV_HEADER = [
+    "timestamp",
+
+    # SPS30
+    "pm1_0",
+    "pm2_5",
+    "pm4_0",
+    "pm10_0",
+    "nc0_5",
+    "nc1_0",
+    "nc2_5",
+    "nc4_0",
+    "nc10_0",
+    "typical_particle_size",
+
+    # MiCS-4514
+    "mics_ox_adc",
+    "mics_red_adc",
+    "mics_power",
+    "mics_ratio_ox",
+    "mics_ratio_red",
+    "co_ppm",
+    "ch4_ppm",
+    "ethanol_ppm",
+    "h2_ppm",
+    "nh3_ppm",
+    "no2_ppm",
+
+    # MQ-136
+    "mq136_raw",
+    "mq136_voltage",
+
+    # SHT41
+    "sht41_temperature",
+    "sht41_humidity",
+
+    # BMP280
+    "bmp280_temperature",
+    "bmp280_pressure",
+    "bmp280_altitude",
+]
+
+
+# ============================================================
+# GLOBAL OBJECTS
+# ============================================================
 
 bus = None
-i2c = None
 
 sps30 = None
-sps30_connection = None
+sps30_transceiver = None
 
 mics_ready = False
+mics_r0_ox = None
+mics_r0_red = None
 
 ads = None
 mq136 = None
@@ -96,604 +111,395 @@ mq136 = None
 sht41 = None
 bmp280 = None
 
-mics_r0_ox = 1.0
-mics_r0_red = 1.0
 
-
-# =========================================================
-# CSV CONFIGURATION
-# =========================================================
-
-CSV_HEADER = [
-    "timestamp",
-
-    # SPS30
-    "PM1_0",
-    "PM2_5",
-    "PM4_0",
-    "PM10",
-
-    "NC0_5",
-    "NC1_0",
-    "NC2_5",
-    "NC4_0",
-    "NC10",
-
-    "TypicalParticleSize",
-
-    # MiCS4514
-    "MICS_OX_ADC",
-    "MICS_RED_ADC",
-    "MICS_POWER",
-
-    "MICS_RATIO_OX",
-    "MICS_RATIO_RED",
-
-    "CO",
-    "CH4",
-    "ETHANOL",
-    "H2",
-    "NH3",
-    "NO2",
-
-    # MQ136
-    "MQ136_RAW",
-    "MQ136_VOLTAGE",
-
-    # SHT41
-    "SHT41_TEMPERATURE",
-    "SHT41_HUMIDITY",
-
-    # BMP280
-    "BMP280_TEMPERATURE",
-    "BMP280_PRESSURE",
-    "BMP280_ALTITUDE"
-]
-
-
-def create_csv():
-
-    if not os.path.exists(CSV_FILE):
-
-        with open(
-            CSV_FILE,
-            "w",
-            newline=""
-        ) as file:
-
-            writer = csv.writer(file)
-            writer.writerow(CSV_HEADER)
-
-        print("[CSV] File created:", CSV_FILE)
-
-
-def save_csv(data):
-
-    row = [
-        data.get(key, "")
-        for key in CSV_HEADER
-    ]
-
-    with open(
-        CSV_FILE,
-        "a",
-        newline=""
-    ) as file:
-
-        writer = csv.writer(file)
-        writer.writerow(row)
-
-
-# =========================================================
-# INITIALIZE I2C
-# =========================================================
+# ============================================================
+# INITIALIZE I2C BUS
+# ============================================================
 
 def initialize_i2c():
 
-    global bus, i2c
+    global bus
 
-    print("\n[INIT] Initializing I2C...")
+    print("\n[INIT] I2C Bus...")
 
-    bus = smbus2.SMBus(I2C_BUS)
+    try:
+        bus = smbus2.SMBus(I2C_BUS)
+        print("[OK] SMBus initialized")
 
-    i2c = board.I2C()
+    except Exception as e:
+        print(f"[ERROR] SMBus: {e}")
+        return False
 
-    print("[OK] I2C initialized")
+    return True
 
 
-# =========================================================
-# SPS30
-# =========================================================
+# ============================================================
+# SPS30 INITIALIZATION
+# ============================================================
 
 def initialize_sps30():
 
-    global sps30, sps30_connection
+    global sps30
+    global sps30_transceiver
 
     print("\n[INIT] SPS30...")
 
     try:
 
-        sps30_connection = LinuxI2cTransceiver(
-            I2C_PORT
-        )
+        sps30_transceiver = LinuxI2cTransceiver(I2C_DEVICE)
+
+        connection = I2cConnection(sps30_transceiver)
 
         channel = I2cChannel(
-            I2cConnection(sps30_connection),
-            slave_address=ADDR_SPS30,
+            connection,
+            slave_address=SPS30_ADDRESS,
             crc=CrcCalculator(
-                8, 0x31, 0xFF, 0x00
+                width=8,
+                polynomial=0x31,
+                init=0xFF,
+                xorout=0x00
             )
         )
 
         sps30 = Sps30Device(channel)
 
-        try:
-            sps30.stop_measurement()
-        except Exception:
-            pass
-
         sps30.start_measurement(
             OutputFormat.OUTPUT_FORMAT_FLOAT
         )
 
-        time.sleep(0.1)
-
         print("[OK] SPS30 initialized")
 
-        try:
-
-            print(
-                "[SPS30] Serial:",
-                sps30.read_serial_number()
-            )
-
-        except Exception:
-            pass
-
-        return True
-
     except Exception as e:
-
-        print("[ERROR] SPS30:", e)
-
+        print(f"[ERROR] SPS30: {e}")
         sps30 = None
-
-        return False
 
 
 def read_sps30():
 
     if sps30 is None:
-        return None
+        return {}
 
-    values = sps30.read_measurement_values_float()
+    try:
 
-    (
-        pm1,
-        pm25,
-        pm4,
-        pm10,
-        nc05,
-        nc1,
-        nc25,
-        nc4,
-        nc10,
-        particle_size
-    ) = values
+        values = sps30.read_measurement_values_float()
 
-    return {
+        return {
+            "pm1_0": values[0],
+            "pm2_5": values[1],
+            "pm4_0": values[2],
+            "pm10_0": values[3],
 
-        "PM1_0": pm1,
-        "PM2_5": pm25,
-        "PM4_0": pm4,
-        "PM10": pm10,
+            "nc0_5": values[4],
+            "nc1_0": values[5],
+            "nc2_5": values[6],
+            "nc4_0": values[7],
+            "nc10_0": values[8],
 
-        "NC0_5": nc05,
-        "NC1_0": nc1,
-        "NC2_5": nc25,
-        "NC4_0": nc4,
-        "NC10": nc10,
+            "typical_particle_size": values[9],
+        }
 
-        "TypicalParticleSize": particle_size
-
-    }
+    except Exception as e:
+        print(f"[ERROR] SPS30 reading: {e}")
+        return {}
 
 
-# =========================================================
-# MiCS-4514 DFRobot SEN0377
-# =========================================================
-
-MICS_OX_REG = 0x04
-MICS_POWER_MODE_REG = 0x0A
-
-MICS_SLEEP = 0x00
-MICS_WAKEUP = 0x01
-
-
-def read_mics_raw():
-
-    data = bus.read_i2c_block_data(
-        ADDR_MICS,
-        MICS_OX_REG,
-        6
-    )
-
-    ox_adc = (data[0] << 8) | data[1]
-
-    red_adc = (data[2] << 8) | data[3]
-
-    power = (data[4] << 8) | data[5]
-
-    ox = max(0, power - ox_adc)
-
-    red = max(0, power - red_adc)
-
-    return ox, red, power
-
-
-def wake_mics():
-
-    mode = bus.read_byte_data(
-        ADDR_MICS,
-        MICS_POWER_MODE_REG
-    )
-
-    print(
-        f"[MICS] Power mode: 0x{mode:02X}"
-    )
-
-    if mode == MICS_SLEEP:
-
-        bus.write_byte_data(
-            ADDR_MICS,
-            MICS_POWER_MODE_REG,
-            MICS_WAKEUP
-        )
-
-        time.sleep(0.1)
-
-        print("[MICS] Wake-up successful")
-
-    elif mode == MICS_WAKEUP:
-
-        print("[MICS] Sensor already awake")
-
-    else:
-
-        raise RuntimeError(
-            f"Unexpected power mode: {mode}"
-        )
-
-
-def calibrate_mics():
-
-    global mics_r0_ox
-    global mics_r0_red
-
-    ox_values = []
-    red_values = []
-
-    print("\n[MICS] Place sensor in clean air.")
-
-    print(
-        f"[MICS] Warm-up: "
-        f"{MICS_CALIBRATION_TIME} seconds"
-    )
-
-    for remaining in range(
-        MICS_CALIBRATION_TIME,
-        0,
-        -1
-    ):
-
-        print(
-            f"\r[MICS] Remaining: {remaining:3d}s",
-            end="",
-            flush=True
-        )
-
-        time.sleep(1)
-
-    print("\n[MICS] Collecting R0 baseline...")
-
-    for index in range(
-        MICS_CALIBRATION_SAMPLES
-    ):
-
-        ox, red, power = read_mics_raw()
-
-        if ox <= 0 or red <= 0:
-
-            raise RuntimeError(
-                "Invalid MICS baseline. "
-                "Check sensor connection."
-            )
-
-        ox_values.append(ox)
-
-        red_values.append(red)
-
-        print(
-            f"[MICS] Calibration "
-            f"{index+1}/{MICS_CALIBRATION_SAMPLES} "
-            f"| OX={ox} RED={red} POWER={power}"
-        )
-
-        time.sleep(1)
-
-    mics_r0_ox = (
-        sum(ox_values) / len(ox_values)
-    )
-
-    mics_r0_red = (
-        sum(red_values) / len(red_values)
-    )
-
-    print("\n[MICS] Calibration completed!")
-
-    print(
-        f"[MICS] R0 OX  = {mics_r0_ox:.2f}"
-    )
-
-    print(
-        f"[MICS] R0 RED = {mics_r0_red:.2f}"
-    )
-
+# ============================================================
+# MiCS-4514 INITIALIZATION
+# ============================================================
 
 def initialize_mics():
 
     global mics_ready
+    global mics_r0_ox
+    global mics_r0_red
 
     print("\n[INIT] MiCS-4514...")
 
+    if bus is None:
+        print("[ERROR] I2C bus unavailable")
+        return
+
     try:
 
-        # Verify I2C communication
+        # Check sensor power mode
         mode = bus.read_byte_data(
-            ADDR_MICS,
-            MICS_POWER_MODE_REG
+            MICS_ADDRESS,
+            0x0A
         )
+
+        print(f"[MiCS] Power mode: 0x{mode:02X}")
+
+        # Wake sensor if sleeping
+        if mode == 0x00:
+
+            bus.write_byte_data(
+                MICS_ADDRESS,
+                0x0A,
+                0x01
+            )
+
+            print("[MiCS] Sensor awakened")
 
         print(
-            f"[MICS] Detected at 0x{ADDR_MICS:02X}"
+            f"[MiCS] Warming up for "
+            f"{MICS_WARMUP_SECONDS} seconds..."
         )
 
-        wake_mics()
+        for remaining in range(
+            MICS_WARMUP_SECONDS,
+            0,
+            -1
+        ):
 
-        calibrate_mics()
+            print(
+                f"\r[MiCS] Warmup: {remaining}s ",
+                end="",
+                flush=True
+            )
+
+            time.sleep(1)
+
+        print("\n[MiCS] Warmup completed")
+
+        # Calibration
+        ox_samples = []
+        red_samples = []
+
+        print("[MiCS] Calibrating R0...")
+
+        for i in range(MICS_CALIBRATION_SAMPLES):
+
+            data = bus.read_i2c_block_data(
+                MICS_ADDRESS,
+                0x04,
+                6
+            )
+
+            ox_adc = (data[0] << 8) | data[1]
+            red_adc = (data[2] << 8) | data[3]
+            power = (data[4] << 8) | data[5]
+
+            ox = max(0, power - ox_adc)
+            red = max(0, power - red_adc)
+
+            ox_samples.append(ox)
+            red_samples.append(red)
+
+            print(
+                f"[MiCS CAL] {i+1}/{MICS_CALIBRATION_SAMPLES} "
+                f"OX={ox} RED={red} POWER={power}"
+            )
+
+            time.sleep(1)
+
+        mics_r0_ox = sum(ox_samples) / len(ox_samples)
+        mics_r0_red = sum(red_samples) / len(red_samples)
+
+        if mics_r0_ox <= 0 or mics_r0_red <= 0:
+            raise ValueError("Invalid MiCS baseline R0")
 
         mics_ready = True
 
         print("[OK] MiCS-4514 initialized")
-
-        return True
+        print(f"[MiCS] R0 OX  = {mics_r0_ox:.2f}")
+        print(f"[MiCS] R0 RED = {mics_r0_red:.2f}")
 
     except Exception as e:
 
-        print("[ERROR] MiCS-4514:", e)
-
+        print(f"[ERROR] MiCS-4514: {e}")
         mics_ready = False
 
-        return False
 
+# ============================================================
+# MiCS-4514 GAS CONVERSION
+# ============================================================
 
-# =========================================================
-# MiCS GAS CONVERSION
-# DFRobot_MICS.cpp equations
-# =========================================================
+def calculate_gas(ratio_ox, ratio_red):
 
-def get_mics_gas(
-    gas,
-    ratio_red,
-    ratio_ox
-):
+    # CO
+    co = 0
 
-    if gas == "CO":
+    if ratio_red <= 0.425:
+        co = (0.425 - ratio_red) / 0.000405
+        co = min(co, 1000)
 
-        if ratio_red > 0.425:
-            return 0.0
+        if co < 1:
+            co = 0
 
-        value = (
-            (0.425 - ratio_red) / 0.000405
-        )
+    # CH4
+    ch4 = 0
 
-        return (
-            min(1000.0, value)
-            if value >= 1
-            else 0.0
-        )
+    if ratio_red <= 0.786:
+        ch4 = (0.786 - ratio_red) / 0.000023
+        ch4 = min(ch4, 25000)
 
-    elif gas == "CH4":
+        if ch4 < 1000:
+            ch4 = 0
 
-        if ratio_red > 0.786:
-            return 0.0
+    # Ethanol
+    ethanol = 0
 
-        value = (
-            (0.786 - ratio_red) / 0.000023
-        )
+    if ratio_red <= 0.306:
+        ethanol = (0.306 - ratio_red) / 0.00057
+        ethanol = min(ethanol, 500)
 
-        return (
-            min(25000.0, value)
-            if value >= 1000
-            else 0.0
-        )
+        if ethanol < 10:
+            ethanol = 0
 
-    elif gas == "ETHANOL":
+    # H2
+    h2 = 0
 
-        if ratio_red > 0.306:
-            return 0.0
+    if ratio_red <= 0.279:
+        h2 = (0.279 - ratio_red) / 0.00026
+        h2 = min(h2, 1000)
 
-        value = (
-            (0.306 - ratio_red) / 0.00057
-        )
+        if h2 < 1:
+            h2 = 0
 
-        return (
-            min(500.0, value)
-            if value >= 10
-            else 0.0
-        )
+    # NH3
+    nh3 = 0
 
-    elif gas == "H2":
+    if ratio_red <= 0.8:
+        nh3 = (0.8 - ratio_red) / 0.0015
+        nh3 = min(nh3, 500)
 
-        if ratio_red > 0.279:
-            return 0.0
+        if nh3 < 10:
+            nh3 = 0
 
-        value = (
-            (0.279 - ratio_red) / 0.00026
-        )
+    # NO2
+    no2 = 0
 
-        return (
-            min(1000.0, value)
-            if value >= 1
-            else 0.0
-        )
+    if ratio_ox >= 1.1:
+        no2 = (ratio_ox - 0.045) / 6.13
+        no2 = min(no2, 10)
 
-    elif gas == "NH3":
-
-        if ratio_red > 0.8:
-            return 0.0
-
-        value = (
-            (0.8 - ratio_red) / 0.0015
-        )
-
-        return (
-            min(500.0, value)
-            if value >= 10
-            else 0.0
-        )
-
-    elif gas == "NO2":
-
-        if ratio_ox < 1.1:
-            return 0.0
-
-        value = (
-            (ratio_ox - 0.045) / 6.13
-        )
-
-        return (
-            min(10.0, value)
-            if value >= 0.1
-            else 0.0
-        )
-
-    return 0.0
-
-
-def get_mics_data():
-
-    if not mics_ready:
-        return None
-
-    ox, red, power = read_mics_raw()
-
-    ratio_ox = ox / mics_r0_ox
-
-    ratio_red = red / mics_r0_red
-
-    gases = {
-
-        "CO": get_mics_gas(
-            "CO", ratio_red, ratio_ox
-        ),
-
-        "CH4": get_mics_gas(
-            "CH4", ratio_red, ratio_ox
-        ),
-
-        "ETHANOL": get_mics_gas(
-            "ETHANOL", ratio_red, ratio_ox
-        ),
-
-        "H2": get_mics_gas(
-            "H2", ratio_red, ratio_ox
-        ),
-
-        "NH3": get_mics_gas(
-            "NH3", ratio_red, ratio_ox
-        ),
-
-        "NO2": get_mics_gas(
-            "NO2", ratio_red, ratio_ox
-        )
-
-    }
+        if no2 < 0.1:
+            no2 = 0
 
     return {
-
-        "MICS_OX_ADC": ox,
-        "MICS_RED_ADC": red,
-        "MICS_POWER": power,
-
-        "MICS_RATIO_OX": ratio_ox,
-        "MICS_RATIO_RED": ratio_red,
-
-        "CO": gases["CO"],
-        "CH4": gases["CH4"],
-        "ETHANOL": gases["ETHANOL"],
-        "H2": gases["H2"],
-        "NH3": gases["NH3"],
-        "NO2": gases["NO2"]
-
+        "co_ppm": co,
+        "ch4_ppm": ch4,
+        "ethanol_ppm": ethanol,
+        "h2_ppm": h2,
+        "nh3_ppm": nh3,
+        "no2_ppm": no2,
     }
 
 
-# =========================================================
-# ADS1115 + MQ-136
-# =========================================================
+# ============================================================
+# MiCS-4514 READING
+# ============================================================
 
-def initialize_ads1115():
+def read_mics():
 
-    global ads, mq136
+    if not mics_ready:
+        return {}
+
+    try:
+
+        data = bus.read_i2c_block_data(
+            MICS_ADDRESS,
+            0x04,
+            6
+        )
+
+        ox_adc = (data[0] << 8) | data[1]
+        red_adc = (data[2] << 8) | data[3]
+        power = (data[4] << 8) | data[5]
+
+        ox = max(0, power - ox_adc)
+        red = max(0, power - red_adc)
+
+        ratio_ox = ox / mics_r0_ox
+        ratio_red = red / mics_r0_red
+
+        gases = calculate_gas(
+            ratio_ox,
+            ratio_red
+        )
+
+        return {
+            "mics_ox_adc": ox_adc,
+            "mics_red_adc": red_adc,
+            "mics_power": power,
+
+            "mics_ratio_ox": ratio_ox,
+            "mics_ratio_red": ratio_red,
+
+            **gases
+        }
+
+    except Exception as e:
+
+        print(f"[ERROR] MiCS reading: {e}")
+        return {}
+
+
+# ============================================================
+# ADS1115 + MQ-136 INITIALIZATION
+# ============================================================
+
+def initialize_ads():
+
+    global ads
+    global mq136
 
     print("\n[INIT] ADS1115 + MQ-136...")
 
     try:
 
+        i2c = board.I2C()
+
         ads = ADS.ADS1115(
             i2c,
-            address=ADDR_ADS1115
+            address=ADS_ADDRESS
         )
 
-        ads.gain = 1
+        ads.gain = ADS_GAIN
 
-        mq136 = AnalogIn(
-            ads,
-            ADS.P0
-        )
+        # ADS1115 channel A0
+        # Use integer 0 instead of ADS.P0
+        mq136 = AnalogIn(ads, 0)
 
-        print("[OK] ADS1115 initialized")
-
-        return True
+        print("[OK] ADS1115 detected")
+        print("[OK] MQ-136 connected to A0")
 
     except Exception as e:
 
-        print("[ERROR] ADS1115:", e)
+        print(f"[ERROR] ADS1115: {e}")
 
         ads = None
         mq136 = None
 
-        return False
 
+# ============================================================
+# MQ-136 READING
+# ============================================================
 
 def read_mq136():
 
     if mq136 is None:
-        return None
+        return {}
 
-    return {
+    try:
 
-        "MQ136_RAW": mq136.value,
+        raw = mq136.value
+        voltage = mq136.voltage
 
-        "MQ136_VOLTAGE": mq136.voltage
+        return {
+            "mq136_raw": raw,
+            "mq136_voltage": voltage,
+        }
 
-    }
+    except Exception as e:
+
+        print(f"[ERROR] MQ-136 reading: {e}")
+        return {}
 
 
-# =========================================================
-# SHT41
-# =========================================================
+# ============================================================
+# SHT41 INITIALIZATION
+# ============================================================
 
 def initialize_sht41():
 
@@ -703,43 +509,48 @@ def initialize_sht41():
 
     try:
 
+        i2c = board.I2C()
+
         sht41 = adafruit_sht4x.SHT4x(
             i2c,
-            address=ADDR_SHT41
+            address=SHT41_ADDRESS
         )
 
         print("[OK] SHT41 initialized")
 
-        return True
-
     except Exception as e:
 
-        print("[ERROR] SHT41:", e)
-
+        print(f"[ERROR] SHT41: {e}")
         sht41 = None
 
-        return False
 
+# ============================================================
+# SHT41 READING
+# ============================================================
 
 def read_sht41():
 
     if sht41 is None:
-        return None
+        return {}
 
-    temperature, humidity = sht41.measurements
+    try:
 
-    return {
+        temperature, humidity = sht41.measurements
 
-        "SHT41_TEMPERATURE": temperature,
+        return {
+            "sht41_temperature": temperature,
+            "sht41_humidity": humidity,
+        }
 
-        "SHT41_HUMIDITY": humidity
+    except Exception as e:
 
-    }
+        print(f"[ERROR] SHT41 reading: {e}")
+        return {}
 
 
-# =========================================================
-# BMP280
-# =========================================================
+# ============================================================
+# BMP280 INITIALIZATION
+# ============================================================
 
 def initialize_bmp280():
 
@@ -749,364 +560,267 @@ def initialize_bmp280():
 
     try:
 
+        i2c = board.I2C()
+
         bmp280 = adafruit_bmp280.Adafruit_BMP280_I2C(
             i2c,
-            address=ADDR_BMP280
+            address=BMP280_ADDRESS
         )
 
         bmp280.sea_level_pressure = 1013.25
 
         print("[OK] BMP280 initialized")
 
-        return True
-
     except Exception as e:
 
-        print("[ERROR] BMP280:", e)
-
+        print(f"[ERROR] BMP280: {e}")
         bmp280 = None
 
-        return False
 
+# ============================================================
+# BMP280 READING
+# ============================================================
 
 def read_bmp280():
 
     if bmp280 is None:
-        return None
+        return {}
 
-    return {
+    try:
 
-        "BMP280_TEMPERATURE": bmp280.temperature,
+        temperature = bmp280.temperature
+        pressure = bmp280.pressure
+        altitude = bmp280.altitude
 
-        "BMP280_PRESSURE": bmp280.pressure,
+        return {
+            "bmp280_temperature": temperature,
+            "bmp280_pressure": pressure,
+            "bmp280_altitude": altitude,
+        }
 
-        "BMP280_ALTITUDE": bmp280.altitude
+    except Exception as e:
 
-    }
+        print(f"[ERROR] BMP280 reading: {e}")
+        return {}
 
 
-# =========================================================
-# DISPLAY DATA
-# =========================================================
+# ============================================================
+# CSV INITIALIZATION
+# ============================================================
 
-def print_section(title):
+def initialize_csv():
 
-    print("\n" + "-" * 65)
+    file_exists = os.path.isfile(LOG_FILE)
 
-    print(title)
+    if not file_exists or os.path.getsize(LOG_FILE) == 0:
 
-    print("-" * 65)
+        with open(
+            LOG_FILE,
+            "w",
+            newline=""
+        ) as file:
 
+            writer = csv.DictWriter(
+                file,
+                fieldnames=CSV_HEADER
+            )
+
+            writer.writeheader()
+
+        print(f"[CSV] Created {LOG_FILE}")
+
+
+# ============================================================
+# CSV SAVE
+# ============================================================
+
+def save_csv(data):
+
+    try:
+
+        with open(
+            LOG_FILE,
+            "a",
+            newline=""
+        ) as file:
+
+            writer = csv.DictWriter(
+                file,
+                fieldnames=CSV_HEADER
+            )
+
+            writer.writerow(data)
+
+    except Exception as e:
+
+        print(f"[ERROR] CSV: {e}")
+
+
+# ============================================================
+# PRINT DATA
+# ============================================================
 
 def print_data():
 
     data = {
-
         key: ""
         for key in CSV_HEADER
     }
 
-    timestamp = datetime.now().isoformat(
+    data["timestamp"] = datetime.now().isoformat(
         timespec="seconds"
     )
 
-    data["timestamp"] = timestamp
-
-    print("\n")
-    print("=" * 65)
-
-    print("       AIR QUALITY & ENVIRONMENT MONITORING")
-
-    print("=" * 65)
-
-    print("TIME:", timestamp)
-
-    # -----------------------------------------------------
-    # SPS30
-    # -----------------------------------------------------
-
-    print_section("SPS30 - PARTICULATE MATTER")
-
-    try:
-
-        result = read_sps30()
-
-        if result:
-
-            data.update(result)
-
-            print(
-                f"PM1.0  : {result['PM1_0']:.2f} ug/m3"
-            )
-
-            print(
-                f"PM2.5  : {result['PM2_5']:.2f} ug/m3"
-            )
-
-            print(
-                f"PM4.0  : {result['PM4_0']:.2f} ug/m3"
-            )
-
-            print(
-                f"PM10   : {result['PM10']:.2f} ug/m3"
-            )
-
-            print(
-                f"NC0.5  : {result['NC0_5']:.2f} #/cm3"
-            )
-
-            print(
-                f"NC1.0  : {result['NC1_0']:.2f} #/cm3"
-            )
-
-            print(
-                f"NC2.5  : {result['NC2_5']:.2f} #/cm3"
-            )
-
-            print(
-                f"NC4.0  : {result['NC4_0']:.2f} #/cm3"
-            )
-
-            print(
-                f"NC10   : {result['NC10']:.2f} #/cm3"
-            )
-
-            print(
-                f"Particle Size: "
-                f"{result['TypicalParticleSize']:.2f} um"
-            )
-
-    except Exception as e:
-
-        print("[SPS30 ERROR]", e)
-
-    # -----------------------------------------------------
-    # MiCS-4514
-    # -----------------------------------------------------
-
-    print_section("MiCS-4514 - GAS SENSOR")
-
-    try:
-
-        result = get_mics_data()
-
-        if result:
-
-            data.update(result)
-
-            print(
-                f"OX={result['MICS_OX_ADC']:4d} "
-                f"RED={result['MICS_RED_ADC']:4d} "
-                f"POWER={result['MICS_POWER']:4d}"
-            )
-
-            print(
-                f"R0_OX={mics_r0_ox:.1f} "
-                f"R0_RED={mics_r0_red:.1f}"
-            )
-
-            print(
-                f"Ratio_OX={result['MICS_RATIO_OX']:.4f} "
-                f"Ratio_RED={result['MICS_RATIO_RED']:.4f}"
-            )
-
-            print(
-                f"CO      : {result['CO']:.2f} ppm"
-            )
-
-            print(
-                f"CH4     : {result['CH4']:.2f} ppm"
-            )
-
-            print(
-                f"Ethanol : {result['ETHANOL']:.2f} ppm"
-            )
-
-            print(
-                f"H2      : {result['H2']:.2f} ppm"
-            )
-
-            print(
-                f"NH3     : {result['NH3']:.2f} ppm"
-            )
-
-            print(
-                f"NO2     : {result['NO2']:.2f} ppm"
-            )
-
-        else:
-
-            print("MiCS-4514 unavailable")
-
-    except Exception as e:
-
-        print("[MICS ERROR]", e)
-
-    # -----------------------------------------------------
-    # MQ136
-    # -----------------------------------------------------
-
-    print_section("MQ-136 - H2S SENSOR")
-
-    try:
-
-        result = read_mq136()
-
-        if result:
-
-            data.update(result)
-
-            print(
-                f"ADC RAW : {result['MQ136_RAW']}"
-            )
-
-            print(
-                f"Voltage : {result['MQ136_VOLTAGE']:.4f} V"
-            )
-
-        else:
-
-            print("ADS1115 unavailable")
-
-    except Exception as e:
-
-        print("[MQ136 ERROR]", e)
-
-    # -----------------------------------------------------
-    # SHT41
-    # -----------------------------------------------------
-
-    print_section("SHT41 - TEMPERATURE & HUMIDITY")
-
-    try:
-
-        result = read_sht41()
-
-        if result:
-
-            data.update(result)
-
-            print(
-                f"Temperature : "
-                f"{result['SHT41_TEMPERATURE']:.2f} C"
-            )
-
-            print(
-                f"Humidity    : "
-                f"{result['SHT41_HUMIDITY']:.2f} %"
-            )
-
-        else:
-
-            print("SHT41 unavailable")
-
-    except Exception as e:
-
-        print("[SHT41 ERROR]", e)
-
-    # -----------------------------------------------------
-    # BMP280
-    # -----------------------------------------------------
-
-    print_section("BMP280 - PRESSURE & ALTITUDE")
-
-    try:
-
-        result = read_bmp280()
-
-        if result:
-
-            data.update(result)
-
-            print(
-                f"Temperature : "
-                f"{result['BMP280_TEMPERATURE']:.2f} C"
-            )
-
-            print(
-                f"Pressure    : "
-                f"{result['BMP280_PRESSURE']:.2f} hPa"
-            )
-
-            print(
-                f"Altitude    : "
-                f"{result['BMP280_ALTITUDE']:.2f} m"
-            )
-
-        else:
-
-            print("BMP280 unavailable")
-
-    except Exception as e:
-
-        print("[BMP280 ERROR]", e)
-
-    # -----------------------------------------------------
-    # SAVE CSV
-    # -----------------------------------------------------
-
-    try:
-
-        save_csv(data)
-
-        print_section("DATA LOGGING")
-
-        print("[CSV] Saved:", CSV_FILE)
-
-    except Exception as e:
-
-        print("[CSV ERROR]", e)
-
+    # Read all sensors
+    data.update(read_sps30())
+    data.update(read_mics())
+    data.update(read_mq136())
+    data.update(read_sht41())
+    data.update(read_bmp280())
+
+    # Display
     print("\n" + "=" * 65)
+    print("       ENVIRONMENT MONITORING SYSTEM")
+    print("=" * 65)
+
+    print(f"Timestamp : {data['timestamp']}")
+
+    print("\n[SPS30] PARTICULATE MATTER")
+
+    print(
+        f"PM1.0  : {data['pm1_0']}"
+    )
+
+    print(
+        f"PM2.5  : {data['pm2_5']}"
+    )
+
+    print(
+        f"PM4.0  : {data['pm4_0']}"
+    )
+
+    print(
+        f"PM10.0 : {data['pm10_0']}"
+    )
+
+    print("\n[MiCS-4514] GAS SENSOR")
+
+    print(
+        f"OX ADC  : {data['mics_ox_adc']}"
+    )
+
+    print(
+        f"RED ADC : {data['mics_red_adc']}"
+    )
+
+    print(
+        f"POWER   : {data['mics_power']}"
+    )
+
+    print(
+        f"Ratio OX  : {data['mics_ratio_ox']}"
+    )
+
+    print(
+        f"Ratio RED : {data['mics_ratio_red']}"
+    )
+
+    print(
+        f"CO      : {data['co_ppm']} ppm"
+    )
+
+    print(
+        f"CH4     : {data['ch4_ppm']} ppm"
+    )
+
+    print(
+        f"Ethanol : {data['ethanol_ppm']} ppm"
+    )
+
+    print(
+        f"H2      : {data['h2_ppm']} ppm"
+    )
+
+    print(
+        f"NH3     : {data['nh3_ppm']} ppm"
+    )
+
+    print(
+        f"NO2     : {data['no2_ppm']} ppm"
+    )
+
+    print("\n[MQ-136] H2S SENSOR")
+
+    print(
+        f"RAW     : {data['mq136_raw']}"
+    )
+
+    print(
+        f"Voltage : {data['mq136_voltage']} V"
+    )
+
+    print("\n[SHT41] TEMPERATURE & HUMIDITY")
+
+    print(
+        f"Temperature : {data['sht41_temperature']} °C"
+    )
+
+    print(
+        f"Humidity    : {data['sht41_humidity']} %"
+    )
+
+    print("\n[BMP280] ATMOSPHERIC")
+
+    print(
+        f"Temperature : {data['bmp280_temperature']} °C"
+    )
+
+    print(
+        f"Pressure    : {data['bmp280_pressure']} hPa"
+    )
+
+    print(
+        f"Altitude    : {data['bmp280_altitude']} m"
+    )
+
+    print("=" * 65)
+
+    save_csv(data)
 
 
-# =========================================================
-# MAIN PROGRAM
-# =========================================================
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
 
     print("\n")
     print("=" * 65)
-
-    print("       RASPBERRY PI SENSOR MONITORING SYSTEM")
-
+    print("       RASPBERRY PI ENVIRONMENT MONITORING")
     print("=" * 65)
+
+    if not initialize_i2c():
+        return
+
+    # Initialize sensors
+    initialize_sps30()
+    initialize_ads()
+    initialize_sht41()
+    initialize_bmp280()
+
+    # MiCS calibration takes approximately 190 seconds
+    initialize_mics()
+
+    # Prepare CSV
+    initialize_csv()
+
+    print("\n[SYSTEM] All initialization completed")
+    print(f"[SYSTEM] Logging interval: {INTERVAL} seconds")
+    print(f"[SYSTEM] CSV file: {LOG_FILE}")
+    print("[SYSTEM] Press CTRL+C to stop")
 
     try:
 
-        # Initialize I2C
-        initialize_i2c()
-
-        # Initialize independent sensors
-        initialize_sps30()
-
-        initialize_ads1115()
-
-        initialize_sht41()
-
-        initialize_bmp280()
-
-        # Initialize and calibrate MiCS
-        initialize_mics()
-
-        # Create CSV
-        create_csv()
-
-        print("\n")
-        print("=" * 65)
-
-        print("ALL SENSOR INITIALIZATION COMPLETED")
-
-        print(
-            f"Sampling interval: {SAMPLE_INTERVAL} seconds"
-        )
-
-        print("Press CTRL+C to stop monitoring.")
-
-        print("=" * 65)
-
-        # Main monitoring loop
         while True:
 
             start_time = time.time()
@@ -1115,33 +829,32 @@ def main():
 
             elapsed = time.time() - start_time
 
-            time.sleep(
-                max(0, SAMPLE_INTERVAL - elapsed)
+            sleep_time = max(
+                0,
+                INTERVAL - elapsed
             )
+
+            time.sleep(sleep_time)
 
     except KeyboardInterrupt:
 
-        print("\n[STOP] Monitoring stopped by user.")
-
-    except Exception as e:
-
-        print("\n[FATAL ERROR]", e)
+        print("\n[SYSTEM] Stopping monitoring...")
 
     finally:
-
-        print("\n[EXIT] Closing sensor connections...")
 
         if sps30 is not None:
 
             try:
                 sps30.stop_measurement()
-            except Exception:
-                pass
+                print("[SPS30] Measurement stopped")
 
-        if sps30_connection is not None:
+            except Exception as e:
+                print(f"[SPS30] Stop error: {e}")
+
+        if sps30_transceiver is not None:
 
             try:
-                sps30_connection.close()
+                sps30_transceiver.close()
             except Exception:
                 pass
 
@@ -1152,20 +865,12 @@ def main():
             except Exception:
                 pass
 
-        if i2c is not None:
-
-            try:
-                i2c.deinit()
-            except Exception:
-                pass
-
-        print("[EXIT] Program terminated.")
+        print("[SYSTEM] Monitoring stopped")
 
 
-# =========================================================
+# ============================================================
 # ENTRY POINT
-# =========================================================
+# ============================================================
 
 if __name__ == "__main__":
-
     main()
